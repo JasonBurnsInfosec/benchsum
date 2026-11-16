@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""benchsum - summarize and compare MangoHud frametime logs, with run-to-run noise.
+
+  benchsum PATH... [--baseline LABEL] [--group-by KEYS] [window options] [--markdown | --json | --csv]
+
+PATH can be a MangoHud CSV, a directory containing them, or a gamerun run directory
+(its manifest.json supplies the label and other metadata). Runs in the same group are
+repeats of one configuration; benchsum reports mean ±95% CI per group and, with --baseline,
+whether each difference is larger than the run-to-run noise (Welch's t-test, with p-value).
+
+Benchmark window (which part of each log is measured), first match wins:
+  --window A-B           seconds of log time, e.g. 268-380
+  --auto-window D[:MS]   a D-second benchmark starting right after the last loading stall
+                         (frame slower than MS ms, default 250) that still has D s of log after it
+  --markers S:E          gamerun markers (`gamerun mark S` / `gamerun mark E`) in the run directory
+  manifest bench_window  what the experiment declared (auto:D[:MS], A-B or markers:S:E)
+  otherwise              the whole log, minus --skip-start / --skip-end
+--write-window writes the window used to <run dir>/window.json (gamerun and threadwatch read it).
+
+gamerun runs whose hook failed or was still running when the game exited (manifest hook_status
+not ok) are skipped unless --include-failed: their logs usually don't contain a benchmark.
+
+Grouping (--group-by, '+'-separated): label (default), experiment, run, append (file_append
+lines from the manifest), env:NAME (an env var the experiment set), field:KEY (any manifest key).
+
+Metric definitions (stated so results can be compared across tools):
+  avg FPS      frames / total frame time (time-weighted, not the mean of per-frame FPS)
+  1% low       1000 / mean of the slowest 1% of frametimes   (same for 0.1% low)
+  p50/p95/p99  frametime percentiles in ms
+  >33ms, >50ms frames slower than 33.3 / 50 ms, per minute (absolute; comparable across FPS levels)
+  rel stutter  frames slower than 2.5x the median AND >4 ms over it, per minute (relative: rises
+               when the median drops, so it is NOT comparable across configurations; JSON/CSV only)
+Stdlib only.
+"""
+import argparse, csv, glob, json, math, os, re, statistics, sys, time
+from collections import OrderedDict
+
+# two-sided 95% t critical values, df 1..30; larger df -> 1.96
+T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145,
+       2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045,
+       2.042]
+
+METRICS = [  # key, header, decimals, show CI in table
+    ('avg_fps', 'avg FPS', 1, True), ('low1', '1% low', 1, True), ('low01', '0.1% low', 1, False),
+    ('p50_ft', 'p50 ms', 2, False), ('p95_ft', 'p95 ms', 2, False), ('p99_ft', 'p99 ms', 2, False),
+    ('spike33_pm', '>33ms/min', 1, False), ('spike50_pm', '>50ms/min', 1, False),
+    ('cpu_load', 'CPU%', 0, False), ('gpu_load', 'GPU%', 0, False),
+]
+COMPARE = ['avg_fps', 'low1', 'low01', 'p99_ft', 'spike33_pm']
+
+
+def t95(df):
+    if df < 1 or math.isnan(df):
+        return float('nan')
+    return T95[min(int(df), 30) - 1] if df <= 30 else 1.96
+
+
+# ---------------------------------------------------------------- statistics
+def betainc(a, b, x):
+    """Regularized incomplete beta I_x(a, b) (continued fraction, Numerical Recipes)."""
+    if x <= 0: return 0.0
+    if x >= 1: return 1.0
+    lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(lb) * _cf(a, b, x) / a
+    return 1 - math.exp(lb) * _cf(b, a, 1 - x) / b
+
+
+def _cf(a, b, x):
+    tiny = 1e-30
+    qab, qap, qam = a + b, a + 1, a - 1
+    c, d = 1.0, 1 - qab * x / qap
+    d = 1 / (d if abs(d) > tiny else tiny); h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)), -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
+            d = 1 + aa * d; d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + aa / c; c = c if abs(c) > tiny else tiny
+            h *= d * c
+        if abs(d * c - 1) < 3e-12:
+            break
+    return h
+
+
+def welch(a, b):
+    """Return (t, df, two-sided p) for Welch's t-test, nan if not computable."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return float('nan'), float('nan'), float('nan')
+    va, vb = statistics.variance(a), statistics.variance(b)
+    se2 = va / na + vb / nb
+    if se2 == 0:
+        same = statistics.fmean(a) == statistics.fmean(b)
+        return (0.0 if same else float('inf')), na + nb - 2, (1.0 if same else 0.0)
+    t = (statistics.fmean(b) - statistics.fmean(a)) / math.sqrt(se2)
+    df = se2 ** 2 / ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1))
+    return t, df, betainc(df / 2, 0.5, df / (df + t * t))
+
+
+def group_stats(values):
+    values = [v for v in values if v is not None and not math.isnan(v)]
+    n = len(values)
+    if not n:
+        return 0, float('nan'), float('nan'), float('nan')
+    m = statistics.fmean(values)
+    sd = statistics.stdev(values) if n > 1 else float('nan')
+    ci = t95(n - 1) * sd / math.sqrt(n) if n > 1 else float('nan')
+    return n, m, sd, ci
+
+
+# ---------------------------------------------------------------- loading
+def find_logs(paths):
+    """Yield (csv_path, run_dir-or-None, manifest-or-None, default label)."""
+    for p in paths:
+        if os.path.isfile(p):
+            yield p, None, None, os.path.basename(p).rsplit('_', 2)[0]
+            continue
+        man_path = os.path.join(p, 'manifest.json')
+        manifest = json.load(open(man_path)) if os.path.exists(man_path) else None
+        csvs = sorted(f for f in glob.glob(os.path.join(p, '**', '*.csv'), recursive=True)
+                      if not f.endswith('_summary.csv') and is_mangohud(f))
+        if manifest:
+            # gamerun run dir: one run, possibly several logs (relaunches); use the longest.
+            if csvs:
+                yield max(csvs, key=os.path.getsize), p, manifest, manifest.get('label')
+            else:
+                print(f'benchsum: no MangoHud log in {p}', file=sys.stderr)
+        else:  # plain directory of logs: the directory name is the configuration label
+            for f in csvs:
+                yield f, None, None, os.path.basename(os.path.normpath(p))
+
+
+def is_mangohud(path):
+    try:
+        with open(path) as f:
+            head = [next(f) for _ in range(3)]
+        return head[0].startswith('os,') and head[2].startswith('fps,frametime')
+    except (OSError, StopIteration, UnicodeDecodeError):
+        return False
+
+
+def load(path):
+    with open(path) as f:
+        lines = f.read().splitlines()
+    sysinfo = dict(zip(lines[0].split(','), next(csv.reader([lines[1]]))))
+    ft, el, cpu, gpu = [], [], [], []
+    for r in csv.DictReader(lines[2:]):
+        try:
+            ft.append(float(r['frametime'])); el.append(float(r['elapsed']) / 1e9)
+            cpu.append(float(r.get('cpu_load') or 0)); gpu.append(float(r.get('gpu_load') or 0))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return sysinfo, ft, el, cpu, gpu
+
+
+def log_start_epoch(path):
+    """MangoHud names logs <exe>_YYYY-MM-DD_HH-MM-SS.csv (local time); 1 s resolution."""
+    m = re.search(r'_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.csv$', path)
+    return time.mktime(time.strptime(m.group(1), '%Y-%m-%d_%H-%M-%S')) if m else None
+
+
+def read_markers(run_dir):
+    out = {}
+    path = os.path.join(run_dir or '', 'markers.tsv')
+    if run_dir and os.path.exists(path):
+        for line in open(path):
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                out.setdefault(parts[1].strip(), float(parts[0]))  # first occurrence of each name
+    return out
+
+
+# ---------------------------------------------------------------- window
+def resolve_window(spec, path, run_dir, ft, el, skip_start, skip_end):
+    """Return (start_s, end_s, source) in log seconds, or (None, None, error-string)."""
+    if not el:
+        return None, None, 'empty log'
+    if not spec:
+        return el[0] + skip_start, el[-1] - skip_end, 'whole log'
+    kind, _, rest = spec.partition(':')
+    if kind == 'auto':
+        dur_s, _, stall_s = rest.partition(':')
+        dur, stall = float(dur_s), float(stall_s or 250)
+        end_log = el[-1]
+        stalls = [t for t, f in zip(el, ft) if f > stall and t + dur <= end_log]
+        if not stalls:
+            return None, None, f'auto:{dur:g}:{stall:g} found no loading stall with {dur:g} s of log after it'
+        start = max(stalls) + 0.3
+        return start, start + dur, f'auto:{dur:g}:{stall:g}'
+    if kind == 'markers':
+        s_name, _, e_name = rest.partition(':')
+        mk = read_markers(run_dir)
+        t0 = log_start_epoch(path)
+        if t0 is None or s_name not in mk or e_name not in mk:
+            return None, None, f'markers {s_name}:{e_name} not found (run dir {run_dir})'
+        return mk[s_name] - t0, mk[e_name] - t0, f'markers:{s_name}:{e_name}'
+    m = re.fullmatch(r'\s*([\d.]+)\s*-\s*([\d.]+)\s*', spec)
+    if m:
+        return float(m.group(1)), float(m.group(2)), f'{float(m.group(1)):g}-{float(m.group(2)):g}'
+    return None, None, f'unknown window spec {spec!r}'
+
+
+def window_spec(args, manifest):
+    if args.window:
+        return args.window
+    if args.auto_window:
+        return 'auto:' + args.auto_window
+    if args.markers:
+        return 'markers:' + args.markers
+    if args.no_manifest_window:
+        return None
+    return (manifest or {}).get('bench_window') or None
+
+
+# ---------------------------------------------------------------- metrics
+def low(desc, frac):
+    k = max(1, int(len(desc) * frac))
+    return 1000.0 / (sum(desc[:k]) / k)
+
+
+def pct(asc, q):
+    if not asc:
+        return float('nan')
+    i = (len(asc) - 1) * q
+    lo, hi = math.floor(i), math.ceil(i)
+    return asc[lo] + (asc[hi] - asc[lo]) * (i - lo)
+
+
+def metrics(ft, el, cpu, gpu, t0, t1):
+    keep = [i for i, t in enumerate(el) if t0 <= t < t1]
+    if len(keep) < 100:
+        return None
+    ft = [ft[i] for i in keep]; cpu = [cpu[i] for i in keep]; gpu = [gpu[i] for i in keep]
+    total_ms = sum(ft); minutes = total_ms / 60000.0
+    desc = sorted(ft, reverse=True); asc = desc[::-1]
+    med = pct(asc, 0.5)
+    return OrderedDict([
+        ('frames', len(ft)), ('seconds', total_ms / 1000.0),
+        ('avg_fps', len(ft) / (total_ms / 1000.0)),
+        ('low1', low(desc, 0.01)), ('low01', low(desc, 0.001)),
+        ('p50_ft', med), ('p95_ft', pct(asc, 0.95)), ('p99_ft', pct(asc, 0.99)),
+        ('spike33_pm', sum(1 for x in ft if x > 33.3) / minutes),
+        ('spike50_pm', sum(1 for x in ft if x > 50.0) / minutes),
+        ('rel_stutter_pm', sum(1 for x in ft if x > 2.5 * med and x - med > 4.0) / minutes),
+        ('max_ft', desc[0]),
+        ('cpu_load', statistics.fmean(cpu)), ('gpu_load', statistics.fmean(gpu)),
+    ])
+
+
+def group_key(keys, manifest, label):
+    m = manifest or {}
+    env = dict(e.split('=', 1) for e in m.get('env', []) if '=' in e)
+    parts = []
+    for k in keys:
+        if k == 'label': parts.append(label or '?')
+        elif k == 'experiment': parts.append(m.get('experiment') or label or '?')
+        elif k == 'run': parts.append(m.get('run_id') or '?')
+        elif k == 'append': parts.append(' | '.join(m.get('file_append', [])) or '(none)')
+        elif k.startswith('env:'): parts.append(f"{k[4:]}={env.get(k[4:], '(unset)')}")
+        elif k.startswith('field:'): parts.append(str(m.get(k[6:], '(none)')))
+        else: raise SystemExit(f'benchsum: unknown --group-by key {k!r}')
+    return ' / '.join(parts)
+
+
+# ---------------------------------------------------------------- output
+def fmt(x, nd=1):
+    return '-' if x is None or (isinstance(x, float) and math.isnan(x)) else f'{x:.{nd}f}'
+
+
+def fmt_p(p):
+    if p is None or math.isnan(p): return '-'
+    return f'{p:.2g}' if p >= 0.001 else f'{p:.1e}'
+
+
+def table(headers, rows, md):
+    if md:
+        out = ['| ' + ' | '.join(headers) + ' |', '|' + '---|' * len(headers)]
+        out += ['| ' + ' | '.join(map(str, r)) + ' |' for r in rows]
+        return '\n'.join(out)
+    w = [max(len(str(x)) for x in col) for col in zip(headers, *rows)]
+    line = lambda r: '  '.join(str(x).rjust(w[i]) if i else str(x).ljust(w[i]) for i, x in enumerate(r))
+    return '\n'.join([line(headers), line(['-' * x for x in w])] + [line(r) for r in rows])
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='benchsum', description=__doc__.split('\n')[0])
+    ap.add_argument('paths', nargs='+', help='MangoHud CSVs, folders of them, or gamerun run directories')
+    ap.add_argument('--baseline', help='group to compare every other group against')
+    ap.add_argument('--group-by', default='label', help="'+'-separated: label, experiment, run, append, env:NAME, field:KEY")
+    ap.add_argument('--window', help='measure log seconds A-B')
+    ap.add_argument('--auto-window', metavar='D[:MS]', help='D-second benchmark after the last loading stall (> MS ms, default 250)')
+    ap.add_argument('--markers', metavar='S:E', help='window between gamerun markers S and E')
+    ap.add_argument('--no-manifest-window', action='store_true', help="ignore the experiment's bench_window")
+    ap.add_argument('--write-window', action='store_true', help='write <run dir>/window.json with the window used')
+    ap.add_argument('--skip-start', type=float, default=0, help='whole-log mode: ignore the first N seconds')
+    ap.add_argument('--skip-end', type=float, default=0, help='whole-log mode: ignore the last N seconds')
+    ap.add_argument('--markdown', action='store_true', help='Markdown tables (for GitHub)')
+    ap.add_argument('--json', action='store_true', help='per-run and per-group stats as JSON')
+    ap.add_argument('--csv', action='store_true', help='one row per run (all metrics) instead of the summary')
+    ap.add_argument('--runs', action='store_true', help='also list every individual run')
+    ap.add_argument('--include-failed', action='store_true', help="include gamerun runs whose hook failed or was still running (hook_status != ok)")
+    a = ap.parse_args()
+    keys = a.group_by.split('+')
+
+    runs = []
+    for path, run_dir, manifest, label in find_logs(a.paths):
+        hs = (manifest or {}).get('hook_status') or ''
+        if hs not in ('', 'ok') and not a.include_failed:
+            print(f'benchsum: skipped {run_dir or path}: hook_status={hs} (use --include-failed to keep it)', file=sys.stderr)
+            continue
+        sysinfo, ft, el, cpu, gpu = load(path)
+        spec = window_spec(a, manifest)
+        t0, t1, source = resolve_window(spec, path, run_dir, ft, el, a.skip_start, a.skip_end)
+        if t0 is None:
+            print(f'benchsum: skipped {path}: {source}', file=sys.stderr)
+            continue
+        m = metrics(ft, el, cpu, gpu, t0, t1)
+        if m is None:
+            print(f'benchsum: skipped {path} (fewer than 100 frames in window {source})', file=sys.stderr)
+            continue
+        if a.write_window and run_dir:
+            ls = log_start_epoch(path)
+            json.dump({'source': source, 'log': os.path.relpath(path, run_dir), 'start_s': round(t0, 3),
+                       'end_s': round(t1, 3), 'start_epoch': round(ls + t0, 3) if ls else None,
+                       'end_epoch': round(ls + t1, 3) if ls else None, 'avg_fps': round(m['avg_fps'], 2),
+                       'frames': m['frames']}, open(os.path.join(run_dir, 'window.json'), 'w'), indent=1)
+        runs.append({'path': path, 'group': group_key(keys, manifest, label), 'label': label,
+                     'run_id': (manifest or {}).get('run_id'), 'window': f'{source} [{t0:.1f}-{t1:.1f}s]',
+                     'sync': (manifest or {}).get('sync'), 'sysinfo': sysinfo, **m})
+    if not runs:
+        print('benchsum: no usable logs', file=sys.stderr)
+        return 1
+
+    groups = OrderedDict()
+    for r in runs:
+        groups.setdefault(r['group'], []).append(r)
+    mkeys = [k for k, *_ in METRICS] + ['rel_stutter_pm', 'max_ft', 'frames', 'seconds']
+
+    if a.csv:
+        w = csv.writer(sys.stdout)
+        w.writerow(['group', 'run_id', 'window', 'sync'] + mkeys + ['path'])
+        for r in runs:
+            w.writerow([r['group'], r['run_id'], r['window'], r['sync']] +
+                       [round(r[k], 4) if isinstance(r[k], float) else r[k] for k in mkeys] + [r['path']])
+        return 0
+
+    if a.json:
+        out = {'runs': runs, 'groups': {}}
+        for g, rs in groups.items():
+            out['groups'][g] = {k: dict(zip(('n', 'mean', 'sd', 'ci95'), group_stats([r[k] for r in rs]))) for k in mkeys}
+        if a.baseline in groups:
+            out['vs_baseline'] = {}
+            for g, rs in groups.items():
+                if g == a.baseline: continue
+                out['vs_baseline'][g] = {}
+                for k in COMPARE:
+                    bv, ov = [r[k] for r in groups[a.baseline]], [r[k] for r in rs]
+                    t, df, p = welch(bv, ov)
+                    bm = statistics.fmean(bv)
+                    out['vs_baseline'][g][k] = {'diff_pct': 100 * (statistics.fmean(ov) - bm) / bm if bm else None,
+                                                't': t, 'df': df, 'p': p}
+        json.dump(out, sys.stdout, indent=1, default=str)
+        print()
+        return 0
+
+    md = a.markdown
+    hdr = ['config', 'n'] + [h for _, h, _, _ in METRICS]
+    rows = []
+    for g, rs in groups.items():
+        cells = [g, len(rs)]
+        for k, _, nd, show_ci in METRICS:
+            n, m, sd, ci = group_stats([r[k] for r in rs])
+            cells.append(fmt(m, nd) + (f' ±{fmt(ci, nd)}' if n > 1 and show_ci else ''))
+        rows.append(cells)
+    print(table(hdr, rows, md))
+    windows = sorted({r['window'].split(' [')[0] for r in runs})
+    print(f"\nwindow: {', '.join(windows)}")
+    if any(len(rs) < 3 for rs in groups.values()):
+        print('Note: groups with n<3 have no reliable noise estimate; run repeats.')
+
+    if a.runs:
+        print()
+        print(table(['config', 'run', 'window', 'sync', 'avg FPS', '1% low', '>33ms/min', 'GPU%'],
+                    [[r['group'], r['run_id'] or os.path.basename(r['path']), r['window'], r['sync'] or '-',
+                      fmt(r['avg_fps']), fmt(r['low1']), fmt(r['spike33_pm']), fmt(r['gpu_load'], 0)] for r in runs], md))
+
+    if a.baseline:
+        if a.baseline not in groups:
+            print(f'\nbenchsum: baseline {a.baseline!r} not found; groups: {", ".join(groups)}', file=sys.stderr)
+            return 1
+        base = groups[a.baseline]
+        out = []
+        for g, rs in groups.items():
+            if g == a.baseline:
+                continue
+            cells = [g]
+            for k in COMPARE:
+                bv, ov = [r[k] for r in base], [r[k] for r in rs]
+                bm, om = statistics.fmean(bv), statistics.fmean(ov)
+                diff = 100.0 * (om - bm) / bm if bm else float('nan')
+                t, df, p = welch(bv, ov)
+                verdict = 'n<2' if math.isnan(t) else ('*' if abs(t) > t95(df) else '')
+                cells.append(f'{diff:+.1f}% p={fmt_p(p)}{verdict and " " + verdict}')
+            out.append(cells)
+        print(f'\nvs baseline "{a.baseline}" (Welch t-test; * = significant at 95%):')
+        print(table(['config'] + [dict((k, h) for k, h, _, _ in METRICS)[k] for k in COMPARE], out, md))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

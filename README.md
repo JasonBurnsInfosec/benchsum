@@ -1,9 +1,10 @@
 # benchsum
 
-**Frame-time statistics for MangoHud logs: average FPS, 1% / 0.1% lows, frame-time percentiles,
-spike counts, and whether a difference between configurations is bigger than run-to-run noise.**
-For comparing Linux gaming settings (Proton versions, ntsync vs fsync, DXVK options, CPU topology,
-kernels, drivers) with repeated benchmark runs instead of single screenshots of an FPS counter.
+**Frame-time statistics for MangoHud and PresentMon logs: average FPS, 1% / 0.1% lows, frame-time
+percentiles, spike counts, charts, and whether a difference between configurations is bigger than
+run-to-run noise.**
+For comparing gaming settings (Proton versions, ntsync vs fsync, DXVK options, CPU topology, kernels,
+drivers, Linux vs Windows) with repeated benchmark runs instead of single screenshots of an FPS counter.
 
 Part of a small toolkit for investigating Linux gaming performance:
 [gamerun](https://github.com/JasonBurnsInfosec/gamerun) (run and record) · **benchsum** (frame-time statistics) ·
@@ -19,15 +20,17 @@ over a whole session are dominated by menus and loading screens.
 
 ## Features
 
-- Reads MangoHud CSV logs, folders of them, or [gamerun](https://github.com/JasonBurnsInfosec/gamerun)
+- Reads **MangoHud** CSV logs (Linux), **PresentMon** 1.x/2.x, **OCAT** and **FrameView** CSV logs (Windows), any
+  other CSV with a frame-time column, folders of logs, or [gamerun](https://github.com/JasonBurnsInfosec/gamerun)
   run directories (label, env vars, file edits and benchmark window come from `manifest.json`)
-- **Benchmark windows**: auto-detect a fixed-length benchmark after the loading screen, or use fixed
-  seconds or gamerun markers
+- **Benchmark windows**: auto-detect a fixed-length benchmark after the loading screen, trim the start
+  and end, use fixed seconds or gamerun markers
 - **Grouping** by label, experiment, environment variable, file edits or any manifest field
 - Metrics: average FPS, 1% and 0.1% lows, p50/p95/p99 frame time, frames over 33 ms and 50 ms per
   minute, CPU/GPU load
 - Statistics: mean ±95% CI per group, Welch's t-test with p-values against a baseline
-- Output: aligned text, Markdown (paste into GitHub issues), JSON, or CSV (one row per run)
+- Output: aligned text, Markdown (paste into GitHub issues), JSON, CSV (one row per run), and an SVG chart
+  (frame time over the benchmark and the frame-time percentile curve per configuration)
 - Python 3.8+, standard library only, a single file
 
 ## Install
@@ -44,6 +47,7 @@ ln -s ~/src/benchsum/benchsum ~/.local/bin/benchsum
 benchsum ~/logs/ntsync ~/logs/fsync --baseline ntsync                 # one folder per configuration
 benchsum ~/logs/ntsync ~/logs/fsync --baseline ntsync --auto-window 112 --markdown
 benchsum runs/214950-*/* --group-by env:PROTON_NO_NTSYNC --baseline 'PROTON_NO_NTSYNC=(unset)'
+benchsum ~/logs/linux ~/logs/windows --baseline windows --plot compare.svg   # MangoHud vs PresentMon logs
 ```
 
 Example output (Total War: ROME II built-in benchmark, 4 interleaved runs each):
@@ -69,9 +73,19 @@ The lows and spikes are the same in both modes.
 
 | input | label |
 |---|---|
-| a MangoHud CSV | file name without the timestamp |
-| a folder of MangoHud CSVs | the folder name; every CSV inside is a repeat |
+| a log file | file name (without MangoHud's timestamp suffix) |
+| a folder of logs | the folder name; every log inside is a repeat |
 | a gamerun run directory | `label` from `manifest.json`; the longest log in it is used |
+
+| format | detected by | notes |
+|---|---|---|
+| MangoHud CSV | system-info header, then `fps,frametime,...` | CPU/GPU load columns are reported too |
+| PresentMon 1.x, OCAT, FrameView | `Application` and `MsBetweenPresents` columns | Windows; `--app REGEX` picks the process (default: the one with most frames, so dwm.exe is ignored) |
+| PresentMon 2.x | `Application` and `FrameTime` columns | same |
+| anything else | `--ft-col NAME` | `--ft-unit ms\|s\|us\|ns\|fps`; `--time-col NAME` (seconds) or elapsed time = sum of frame times |
+
+To compare Linux and Windows, run the same benchmark on both, log with MangoHud and PresentMon, and give
+benchsum one folder per OS.
 
 ## Options
 
@@ -80,7 +94,8 @@ The lows and spikes are the same in both modes.
 | `--baseline GROUP` | compare every other group against this one |
 | `--group-by KEYS` | `+`-separated: `label` (default), `experiment`, `run`, `append` (gamerun file edits), `env:NAME`, `field:KEY` (any manifest key) |
 | `--auto-window D[:MS]` | measure a D-second benchmark that starts right after the last loading stall (frame slower than MS ms, default 250) with D seconds of log after it |
-| `--window A-B` | measure log seconds A to B |
+| `--window A-B` | measure log seconds A to B (also takes any window spec, e.g. `trim:10:5`) |
+| `trim:S:E` (as `--window` or `bench_window`) | the whole log minus S seconds at the start and E at the end |
 | `--markers S:E` | measure between gamerun markers S and E |
 | `--no-manifest-window` | ignore the experiment's `bench_window` |
 | `--write-window` | save the window used as `<run dir>/window.json` (used by gamerun and threadwatch) |
@@ -90,6 +105,9 @@ The lows and spikes are the same in both modes.
 | `--markdown` | tables ready for GitHub |
 | `--json` | per-run metrics, per-group stats and per-metric tests against the baseline |
 | `--csv` | one row per run with every metric |
+| `--plot FILE.svg` | chart: frame time over the window (every run) and frame-time percentiles (mean per group); convert with `rsvg-convert` or `magick` for PNG |
+| `--app REGEX` | PresentMon/OCAT/FrameView: which `Application` to keep |
+| `--ft-col NAME`, `--ft-unit U`, `--time-col NAME` | read other CSV formats |
 
 Window precedence: `--window`, `--auto-window`, `--markers`, the manifest's `bench_window`, whole log.
 Group names combine the keys, e.g. `--group-by env:WINE_CPU_TOPOLOGY+env:PROTON_NO_NTSYNC` gives
@@ -128,8 +146,8 @@ Check the reported window with `--runs` the first time you use it on a new game.
 
 ## Limitations
 
-- MangoHud CSV only (the format with a system-info header, `fps,frametime,…,elapsed` columns). Tested
-  with MangoHud 0.8.x.
+- Tested with MangoHud 0.8.x logs; PresentMon support follows its documented CSV columns (tested with
+  synthetic files).
 - Marker windows rely on the log's file-name timestamp (1 s resolution).
 - One log per run: in a gamerun run directory with several logs (relaunches), the longest is used.
 

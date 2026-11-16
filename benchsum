@@ -3,13 +3,17 @@
 
   benchsum PATH... [--baseline LABEL] [--group-by KEYS] [window options] [--markdown | --json | --csv]
 
-PATH can be a MangoHud CSV, a directory containing them, or a gamerun run directory
+PATH can be a frame-time log, a directory containing logs, or a gamerun run directory
 (its manifest.json supplies the label and other metadata). Runs in the same group are
 repeats of one configuration; benchsum reports mean ±95% CI per group and, with --baseline,
 whether each difference is larger than the run-to-run noise (Welch's t-test, with p-value).
 
+Log formats: MangoHud CSV; PresentMon 1.x/2.x, OCAT and FrameView CSV (Windows; --app picks the process,
+default the one with most frames); any other CSV with --ft-col NAME [--ft-unit ms|s|us|ns|fps] [--time-col NAME].
+
 Benchmark window (which part of each log is measured), first match wins:
-  --window A-B           seconds of log time, e.g. 268-380
+  --window A-B           seconds of log time, e.g. 268-380 (also accepts any spec below, e.g. trim:10:5)
+  trim:S:E               drop S seconds at the start and E at the end (manifest bench_window or --window)
   --auto-window D[:MS]   a D-second benchmark starting right after the last loading stall
                          (frame slower than MS ms, default 250) that still has D s of log after it
   --markers S:E          gamerun markers (`gamerun mark S` / `gamerun mark E`) in the run directory
@@ -109,48 +113,113 @@ def group_stats(values):
 
 
 # ---------------------------------------------------------------- loading
+OPTS = None  # parsed args, for format options used while scanning folders
+
+PM_FT_COLS = ('MsBetweenPresents', 'FrameTime', 'msBetweenPresents')  # PresentMon 1.x/OCAT/FrameView, PresentMon 2.x
+
+
+def detect_format(path):
+    """'mangohud', 'presentmon', 'generic' (--ft-col present) or None."""
+    try:
+        with open(path, errors='replace') as f:
+            head = [next(f, '') for _ in range(3)]
+    except OSError:
+        return None
+    if head[0].startswith('os,') and head[2].startswith('fps,frametime'):
+        return 'mangohud'
+    cols = [c.strip() for c in head[0].strip().split(',')]
+    if 'Application' in cols and any(c in cols for c in PM_FT_COLS):
+        return 'presentmon'
+    if OPTS is not None and OPTS.ft_col and OPTS.ft_col in cols:
+        return 'generic'
+    return None
+
+
+def default_label(path):
+    base = os.path.basename(path)
+    base = re.sub(r'\.csv$', '', base, flags=re.I)
+    base = re.sub(r'_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$', '', base)  # MangoHud timestamp suffix
+    return base
+
+
 def find_logs(paths):
     """Yield (csv_path, run_dir-or-None, manifest-or-None, default label)."""
     for p in paths:
         if os.path.isfile(p):
-            yield p, None, None, os.path.basename(p).rsplit('_', 2)[0]
+            yield p, None, None, default_label(p)
             continue
         man_path = os.path.join(p, 'manifest.json')
         manifest = json.load(open(man_path)) if os.path.exists(man_path) else None
         csvs = sorted(f for f in glob.glob(os.path.join(p, '**', '*.csv'), recursive=True)
-                      if not f.endswith('_summary.csv') and is_mangohud(f))
+                      if not f.endswith('_summary.csv') and detect_format(f))
         if manifest:
             # gamerun run dir: one run, possibly several logs (relaunches); use the longest.
             if csvs:
                 yield max(csvs, key=os.path.getsize), p, manifest, manifest.get('label')
             else:
-                print(f'benchsum: no MangoHud log in {p}', file=sys.stderr)
+                print(f'benchsum: no frame-time log in {p}', file=sys.stderr)
         else:  # plain directory of logs: the directory name is the configuration label
             for f in csvs:
                 yield f, None, None, os.path.basename(os.path.normpath(p))
 
 
-def is_mangohud(path):
-    try:
-        with open(path) as f:
-            head = [next(f) for _ in range(3)]
-        return head[0].startswith('os,') and head[2].startswith('fps,frametime')
-    except (OSError, StopIteration, UnicodeDecodeError):
-        return False
+def to_ms(v, unit):
+    return {'ms': v, 's': v * 1000.0, 'us': v / 1000.0, 'ns': v / 1e6}.get(unit, v) if unit != 'fps' else (1000.0 / v if v else 0.0)
 
 
 def load(path):
-    with open(path) as f:
-        lines = f.read().splitlines()
-    sysinfo = dict(zip(lines[0].split(','), next(csv.reader([lines[1]]))))
+    """Return (sysinfo, frametimes_ms, elapsed_s, cpu_load, gpu_load, format)."""
+    fmt_ = detect_format(path)
     ft, el, cpu, gpu = [], [], [], []
-    for r in csv.DictReader(lines[2:]):
+    nan = float('nan')
+    if fmt_ == 'mangohud':
+        with open(path) as f:
+            lines = f.read().splitlines()
+        sysinfo = dict(zip(lines[0].split(','), next(csv.reader([lines[1]]))))
+        for r in csv.DictReader(lines[2:]):
+            try:
+                ft.append(float(r['frametime'])); el.append(float(r['elapsed']) / 1e9)
+                cpu.append(float(r.get('cpu_load') or 0)); gpu.append(float(r.get('gpu_load') or 0))
+            except (KeyError, ValueError, TypeError):
+                continue
+        return sysinfo, ft, el, cpu, gpu, fmt_
+    with open(path, newline='', errors='replace') as f:
+        rows = list(csv.DictReader(f))
+    if fmt_ == 'presentmon':
+        col = next(c for c in PM_FT_COLS if c in rows[0])
+        apps = {}
+        for r in rows:
+            apps[r.get('Application', '')] = apps.get(r.get('Application', ''), 0) + 1
+        if OPTS is not None and OPTS.app:
+            rx = re.compile(OPTS.app, re.I)
+            keep_apps = {a for a in apps if rx.search(a)}
+        else:
+            keep_apps = {max(apps, key=apps.get)} if apps else set()  # the process with the most frames
+        unit, tcol, sysinfo = 'ms', None, {'source': 'PresentMon/OCAT/FrameView', 'application': ', '.join(sorted(keep_apps))}
+        rows = [r for r in rows if r.get('Application', '') in keep_apps]
+    elif fmt_ == 'generic':
+        col, unit, tcol = OPTS.ft_col, OPTS.ft_unit, OPTS.time_col
+        sysinfo = {'source': f'CSV column {col} ({unit})'}
+    else:
+        return {}, [], [], [], [], None
+    t = 0.0
+    for r in rows:
         try:
-            ft.append(float(r['frametime'])); el.append(float(r['elapsed']) / 1e9)
-            cpu.append(float(r.get('cpu_load') or 0)); gpu.append(float(r.get('gpu_load') or 0))
+            v = to_ms(float(r[col]), unit)
         except (KeyError, ValueError, TypeError):
             continue
-    return sysinfo, ft, el, cpu, gpu
+        if v <= 0:
+            continue
+        if tcol:
+            try:
+                el.append(float(r[tcol]))
+            except (KeyError, ValueError, TypeError):
+                continue
+        else:
+            t += v / 1000.0
+            el.append(t)  # elapsed reconstructed from the frame times
+        ft.append(v); cpu.append(nan); gpu.append(nan)
+    return sysinfo, ft, el, cpu, gpu, fmt_
 
 
 def log_start_epoch(path):
@@ -187,6 +256,10 @@ def resolve_window(spec, path, run_dir, ft, el, skip_start, skip_end):
             return None, None, f'auto:{dur:g}:{stall:g} found no loading stall with {dur:g} s of log after it'
         start = max(stalls) + 0.3
         return start, start + dur, f'auto:{dur:g}:{stall:g}'
+    if kind == 'trim':
+        a_s, _, b_s = rest.partition(':')
+        a_, b_ = float(a_s or 0), float(b_s or 0)
+        return el[0] + a_, el[-1] - b_, f'trim:{a_:g}:{b_:g}'
     if kind == 'markers':
         s_name, _, e_name = rest.partition(':')
         mk = read_markers(run_dir)
@@ -226,10 +299,12 @@ def pct(asc, q):
     return asc[lo] + (asc[hi] - asc[lo]) * (i - lo)
 
 
-def metrics(ft, el, cpu, gpu, t0, t1):
+def metrics(ft, el, cpu, gpu, t0, t1, keep_frames=None):
     keep = [i for i, t in enumerate(el) if t0 <= t < t1]
     if len(keep) < 100:
         return None
+    if keep_frames is not None:
+        keep_frames.extend((el[i] - t0, ft[i]) for i in keep)
     ft = [ft[i] for i in keep]; cpu = [cpu[i] for i in keep]; gpu = [gpu[i] for i in keep]
     total_ms = sum(ft); minutes = total_ms / 60000.0
     desc = sorted(ft, reverse=True); asc = desc[::-1]
@@ -243,7 +318,7 @@ def metrics(ft, el, cpu, gpu, t0, t1):
         ('spike50_pm', sum(1 for x in ft if x > 50.0) / minutes),
         ('rel_stutter_pm', sum(1 for x in ft if x > 2.5 * med and x - med > 4.0) / minutes),
         ('max_ft', desc[0]),
-        ('cpu_load', statistics.fmean(cpu)), ('gpu_load', statistics.fmean(gpu)),
+        ('cpu_load', statistics.fmean(cpu) if cpu else float('nan')), ('gpu_load', statistics.fmean(gpu) if gpu else float('nan')),
     ])
 
 
@@ -282,6 +357,87 @@ def table(headers, rows, md):
     return '\n'.join([line(headers), line(['-' * x for x in w])] + [line(r) for r in rows])
 
 
+# ---------------------------------------------------------------- plot
+PALETTE = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00', '#56B4E9', '#000000', '#F0E442']  # Okabe-Ito
+
+
+def plot_svg(path, groups, frames):
+    """Two panels: frame time over the window (max per bin, every run) and the frame-time percentile curve
+    (mean across a group's runs). Plain SVG, no dependencies; convert with rsvg-convert/magick if needed."""
+    W, H, L, R, T = 980, 720, 70, 200, 40
+    ph = 270  # panel height
+    names = list(groups)
+    col = {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(names)}
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif" font-size="12">',
+           f'<rect width="{W}" height="{H}" fill="white"/>']
+    esc = lambda t: str(t).replace('&', '&amp;').replace('<', '&lt;')
+    allft = sorted(f for rs in groups.values() for r in rs for _, f in frames[id(r)])
+    if not allft:
+        return
+    ymax = max(10.0, pct(allft, 0.999) * 1.15)
+    tmax = max(t for rs in groups.values() for r in rs for t, _ in frames[id(r)]) or 1
+    pw = W - L - R
+
+    def axes(y0, title, xlab, ylab, yticks, xticks):
+        out.append(f'<text x="{L}" y="{y0 - 12}" font-size="14" font-weight="bold">{esc(title)}</text>')
+        out.append(f'<rect x="{L}" y="{y0}" width="{pw}" height="{ph}" fill="none" stroke="#999"/>')
+        for v, ypix in yticks:
+            out.append(f'<line x1="{L}" x2="{L + pw}" y1="{ypix:.1f}" y2="{ypix:.1f}" stroke="#eee"/>')
+            out.append(f'<text x="{L - 6}" y="{ypix + 4:.1f}" text-anchor="end">{v}</text>')
+        for v, xpix in xticks:
+            out.append(f'<text x="{xpix:.1f}" y="{y0 + ph + 16}" text-anchor="middle">{v}</text>')
+        out.append(f'<text x="{L + pw / 2}" y="{y0 + ph + 34}" text-anchor="middle">{esc(xlab)}</text>')
+        out.append(f'<text transform="translate(18,{y0 + ph / 2}) rotate(-90)" text-anchor="middle">{esc(ylab)}</text>')
+
+    def nice(maxv, n=5):
+        raw = maxv / n
+        mag = 10 ** math.floor(math.log10(raw))
+        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+        return [round(i * step, 6) for i in range(int(maxv / step) + 1)]
+
+    # panel 1: frame time over time
+    y0 = T
+    yv = lambda v: y0 + ph - min(v, ymax) / ymax * ph
+    axes(y0, 'Frame time over the benchmark window (max per bin)', 'seconds into window', 'frame time (ms)',
+         [(f'{v:g}', yv(v)) for v in nice(ymax)], [(f'{v:g}', L + v / tmax * pw) for v in nice(tmax)])
+    for g in names:
+        for r in groups[g]:
+            fr = frames[id(r)]
+            nb = min(pw, len(fr))
+            bins = [0.0] * nb
+            for t, f in fr:
+                b = min(nb - 1, int(t / tmax * nb))
+                bins[b] = max(bins[b], f)
+            pts = ' '.join(f'{L + (i + 0.5) / nb * pw:.1f},{yv(v):.1f}' for i, v in enumerate(bins) if v > 0)
+            out.append(f'<polyline fill="none" stroke="{col[g]}" stroke-width="1" stroke-opacity="0.7" points="{pts}"/>')
+
+    # panel 2: percentile curve
+    y0 = T + ph + 80
+    qs = [0.5, 0.75, 0.9, 0.95, 0.99, 0.995, 0.999]
+    xq = lambda i: L + i / (len(qs) - 1) * pw
+    curves = {g: [statistics.fmean(pct(sorted(f for _, f in frames[id(r)]), q) for r in groups[g]) for q in qs] for g in names}
+    ymax2 = max(max(c) for c in curves.values()) * 1.15
+    yv2 = lambda v: y0 + ph - v / ymax2 * ph
+    axes(y0, 'Frame-time percentiles (mean of runs; higher = worse)', 'percentile', 'frame time (ms)',
+         [(f'{v:g}', yv2(v)) for v in nice(ymax2)], [(f'p{q * 100:g}', xq(i)) for i, q in enumerate(qs)])
+    for g in names:
+        pts = ' '.join(f'{xq(i):.1f},{yv2(v):.1f}' for i, v in enumerate(curves[g]))
+        out.append(f'<polyline fill="none" stroke="{col[g]}" stroke-width="2" points="{pts}"/>')
+        out += [f'<circle cx="{xq(i):.1f}" cy="{yv2(v):.1f}" r="3" fill="{col[g]}"/>' for i, v in enumerate(curves[g])]
+
+    # legend
+    for i, g in enumerate(names):
+        y = T + 10 + i * 34
+        n = len(groups[g]); fps = statistics.fmean(r['avg_fps'] for r in groups[g])
+        out.append(f'<rect x="{W - R + 15}" y="{y}" width="14" height="14" fill="{col[g]}"/>')
+        out.append(f'<text x="{W - R + 35}" y="{y + 11}">{esc(g[:24])}</text>')
+        out.append(f'<text x="{W - R + 35}" y="{y + 25}" fill="#555">n={n}, {fps:.1f} FPS</text>')
+    out.append('</svg>')
+    with open(path, 'w') as f:
+        f.write('\n'.join(out))
+    print(f'benchsum: plot written to {path}', file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(prog='benchsum', description=__doc__.split('\n')[0])
     ap.add_argument('paths', nargs='+', help='MangoHud CSVs, folders of them, or gamerun run directories')
@@ -298,9 +454,17 @@ def main():
     ap.add_argument('--json', action='store_true', help='per-run and per-group stats as JSON')
     ap.add_argument('--csv', action='store_true', help='one row per run (all metrics) instead of the summary')
     ap.add_argument('--runs', action='store_true', help='also list every individual run')
+    ap.add_argument('--plot', metavar='FILE.svg', help='write frame-time and percentile charts (SVG)')
+    ap.add_argument('--app', metavar='REGEX', help='PresentMon/OCAT/FrameView: Application(s) to keep (default: the one with most frames)')
+    ap.add_argument('--ft-col', metavar='NAME', help='other CSV formats: column holding frame times')
+    ap.add_argument('--ft-unit', default='ms', choices=['ms', 's', 'us', 'ns', 'fps'], help='unit of --ft-col (default ms; fps = frames per second)')
+    ap.add_argument('--time-col', metavar='NAME', help='other CSV formats: column with a timestamp in seconds (default: sum of frame times)')
     ap.add_argument('--include-failed', action='store_true', help="include gamerun runs whose hook failed or was still running (hook_status != ok)")
     a = ap.parse_args()
+    global OPTS
+    OPTS = a
     keys = a.group_by.split('+')
+    frames = {}
 
     runs = []
     for path, run_dir, manifest, label in find_logs(a.paths):
@@ -308,13 +472,17 @@ def main():
         if hs not in ('', 'ok') and not a.include_failed:
             print(f'benchsum: skipped {run_dir or path}: hook_status={hs} (use --include-failed to keep it)', file=sys.stderr)
             continue
-        sysinfo, ft, el, cpu, gpu = load(path)
+        sysinfo, ft, el, cpu, gpu, fmt_ = load(path)
+        if not fmt_:
+            print(f'benchsum: skipped {path}: not a MangoHud/PresentMon log (other CSVs need --ft-col)', file=sys.stderr)
+            continue
         spec = window_spec(a, manifest)
         t0, t1, source = resolve_window(spec, path, run_dir, ft, el, a.skip_start, a.skip_end)
         if t0 is None:
             print(f'benchsum: skipped {path}: {source}', file=sys.stderr)
             continue
-        m = metrics(ft, el, cpu, gpu, t0, t1)
+        kept = [] if a.plot else None
+        m = metrics(ft, el, cpu, gpu, t0, t1, kept)
         if m is None:
             print(f'benchsum: skipped {path} (fewer than 100 frames in window {source})', file=sys.stderr)
             continue
@@ -324,9 +492,11 @@ def main():
                        'end_s': round(t1, 3), 'start_epoch': round(ls + t0, 3) if ls else None,
                        'end_epoch': round(ls + t1, 3) if ls else None, 'avg_fps': round(m['avg_fps'], 2),
                        'frames': m['frames']}, open(os.path.join(run_dir, 'window.json'), 'w'), indent=1)
-        runs.append({'path': path, 'group': group_key(keys, manifest, label), 'label': label,
+        runs.append({'format': fmt_, 'path': path, 'group': group_key(keys, manifest, label), 'label': label,
                      'run_id': (manifest or {}).get('run_id'), 'window': f'{source} [{t0:.1f}-{t1:.1f}s]',
                      'sync': (manifest or {}).get('sync'), 'sysinfo': sysinfo, **m})
+        if kept is not None:
+            frames[id(runs[-1])] = kept
     if not runs:
         print('benchsum: no usable logs', file=sys.stderr)
         return 1
@@ -335,6 +505,8 @@ def main():
     for r in runs:
         groups.setdefault(r['group'], []).append(r)
     mkeys = [k for k, *_ in METRICS] + ['rel_stutter_pm', 'max_ft', 'frames', 'seconds']
+    if a.plot:
+        plot_svg(a.plot, groups, frames)
 
     if a.csv:
         w = csv.writer(sys.stdout)
@@ -400,7 +572,8 @@ def main():
                 diff = 100.0 * (om - bm) / bm if bm else float('nan')
                 t, df, p = welch(bv, ov)
                 verdict = 'n<2' if math.isnan(t) else ('*' if abs(t) > t95(df) else '')
-                cells.append(f'{diff:+.1f}% p={fmt_p(p)}{verdict and " " + verdict}')
+                d_txt = '-' if math.isnan(diff) else f'{diff:+.1f}%'
+                cells.append(f'{d_txt} p={fmt_p(p)}{verdict and " " + verdict}')
             out.append(cells)
         print(f'\nvs baseline "{a.baseline}" (Welch t-test; * = significant at 95%):')
         print(table(['config'] + [dict((k, h) for k, h, _, _ in METRICS)[k] for k in COMPARE], out, md))
